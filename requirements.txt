@@ -1,0 +1,8 @@
+customtkinter
+faster-whisper
+sounddevice
+numpy
+scipy
+requests
+PyAudioWPatch
+av<19
