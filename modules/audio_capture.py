@@ -1,236 +1,216 @@
-import sounddevice as sd
-import scipy.io.wavfile as wav
-import numpy as np
-import pyaudiowpatch as pyaudio
+import collections
 import queue
 import threading
+import time
+from math import gcd
 
-SAMPLE_RATE = 16000
-CHUNK_DURATION = 3
-CHUNK_FRAMES = SAMPLE_RATE * CHUNK_DURATION
+import numpy as np
 
-audio_queue = queue.Queue()
-audio_data = []
-
-recording_stream = None
-system_stream = None
-system_audio = None
-
-recording = False
-audio_lock = threading.Lock()
-
-mic_buffer = []
-system_buffer = []
-
-mic_lock = threading.Lock()
-system_lock = threading.Lock()
+TARGET_RATE = 16000
+BLOCK_SECONDS = 0.1
+TARGET_BLOCK = int(TARGET_RATE * BLOCK_SECONDS)  # 1600 samples
 
 
-def start_recording():
-
-    global recording_stream
-    global system_stream, system_audio
-    global recording, audio_data
-    global mic_buffer, system_buffer
-
-    with audio_lock:
-        audio_data = []
-
-    with mic_lock:
-        mic_buffer = []
-
-    with system_lock:
-        system_buffer = []
-
-    while not audio_queue.empty():
-        audio_queue.get_nowait()
-
-    recording = True
-
-    # MICROPHONE CAPTURE
-
-    def mic_callback(indata, frames, time, status):
-
-        global mic_buffer
-
-        if not recording:
-            return
-
-        if status:
-            print("MIC STATUS:", status)
-
-        samples = indata[:, 0].copy()
-
-        with audio_lock:
-            audio_data.append(samples.copy())
-
-        with mic_lock:
-            mic_buffer.extend(samples.tolist())
-
-            while len(mic_buffer) >= CHUNK_FRAMES:
-
-                chunk = np.array(
-                    mic_buffer[:CHUNK_FRAMES],
-                    dtype=np.int16
-                )
-
-                del mic_buffer[:CHUNK_FRAMES]
-
-                audio_queue.put(chunk)
-
-    recording_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        callback=mic_callback,
-        blocksize=1024
-    )
-
-    recording_stream.start()
-
-    # SYSTEM AUDIO CAPTURE
-
-    system_audio = pyaudio.PyAudio()
-
-    device = system_audio.get_default_wasapi_loopback()
-
-    system_stream = system_audio.open(
-        format=pyaudio.paInt16,
-        channels=2,
-        rate=int(device["defaultSampleRate"]),
-        input=True,
-        input_device_index=device["index"],
-        frames_per_buffer=4096
-    )
-
-    threading.Thread(
-        target=capture_system_audio,
-        daemon=True
-    ).start()
-
-    print("Microphone and system audio recording started!")
-
-
-def capture_system_audio():
-
-    global system_buffer
-
-    source_rate = int(system_stream._rate)
-
-    while recording:
-
+def put_drop_oldest(q, item):
+    """Put item on q; if q is full, throw away the oldest item first."""
+    while True:
         try:
+            q.put_nowait(item)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
 
-            data = system_stream.read(
-                4096,
-                exception_on_overflow=False
+
+def _to_16k(block, rate):
+    from scipy.signal import resample_poly
+
+    if rate == TARGET_RATE:
+        return block.astype(np.float32)
+    g = gcd(TARGET_RATE, rate)
+    out = resample_poly(block, TARGET_RATE // g, rate // g)
+    return out.astype(np.float32)
+
+
+class _Source:
+    """Collects native-rate mono audio and exposes 100 ms blocks at 16 kHz."""
+
+    def __init__(self, name):
+        self.name = name
+        self.rate = TARGET_RATE
+        self._native = np.zeros(0, dtype=np.float32)
+        self.blocks = collections.deque(maxlen=50)  # deque appends/pops are thread-safe
+
+    def feed(self, mono, rate):
+        self.rate = rate
+        self._native = np.concatenate([self._native, mono])
+        need = int(rate * BLOCK_SECONDS)
+        while len(self._native) >= need:
+            part, self._native = self._native[:need], self._native[need:]
+            block = _to_16k(part, rate)
+            if len(block) != TARGET_BLOCK:  # rounding safety
+                block = np.resize(block, TARGET_BLOCK)
+            self.blocks.append(block)
+
+    def pop(self):
+        # If a source got far ahead, drop old blocks so it stays in sync.
+        while len(self.blocks) > 3:
+            self.blocks.popleft()
+        try:
+            return self.blocks.popleft()
+        except IndexError:
+            return None
+
+    def close(self):
+        pass
+
+
+class _MicSource(_Source):
+    def __init__(self):
+        super().__init__("microphone")
+        import sounddevice as sd
+
+        info = sd.query_devices(kind="input")
+        rate = int(info["default_samplerate"])
+        self._stream = sd.InputStream(
+            channels=1,
+            samplerate=rate,
+            dtype="float32",
+            callback=self._callback,
+        )
+        self._rate = rate
+        self._stream.start()
+
+    def _callback(self, indata, frames, time_info, status):
+        try:
+            self.feed(indata[:, 0].copy(), self._rate)
+        except Exception:  # noqa: BLE001  - never raise inside an audio callback
+            pass
+
+    def close(self):
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _LoopbackSource(_Source):
+    def __init__(self):
+        super().__init__("system audio")
+        import pyaudiowpatch as pyaudio
+
+        self._pa = pyaudio.PyAudio()
+        try:
+            wasapi = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            speakers = self._pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+            if not speakers.get("isLoopbackDevice"):
+                found = None
+                for dev in self._pa.get_loopback_device_info_generator():
+                    if speakers["name"] in dev["name"]:
+                        found = dev
+                        break
+                if found is None:
+                    raise RuntimeError("No loopback device found for '%s'" % speakers["name"])
+                speakers = found
+            self._channels = int(speakers["maxInputChannels"])
+            self._rate = int(speakers["defaultSampleRate"])
+            self._pyaudio = pyaudio
+            self._stream = self._pa.open(
+                format=pyaudio.paFloat32,
+                channels=self._channels,
+                rate=self._rate,
+                input=True,
+                input_device_index=speakers["index"],
+                frames_per_buffer=int(self._rate * 0.05),
+                stream_callback=self._callback,
             )
+        except Exception:
+            self._pa.terminate()
+            raise
 
-            samples = np.frombuffer(
-                data,
-                dtype=np.int16
-            ).reshape(-1, 2)
+    def _callback(self, in_data, frame_count, time_info, status):
+        try:
+            data = np.frombuffer(in_data, dtype=np.float32)
+            if self._channels > 1:
+                data = data.reshape(-1, self._channels).mean(axis=1)
+            self.feed(data.copy(), self._rate)
+        except Exception:  # noqa: BLE001
+            pass
+        return (None, self._pyaudio.paContinue)
 
-            mono = samples.mean(
-                axis=1
-            ).astype(np.int16)
-
-            # Convert system audio to 16 kHz
-
-            if source_rate != SAMPLE_RATE:
-
-                target_length = int(
-                    len(mono) * SAMPLE_RATE / source_rate
-                )
-
-                positions = np.linspace(
-                    0,
-                    len(mono) - 1,
-                    target_length
-                )
-
-                mono = np.interp(
-                    positions,
-                    np.arange(len(mono)),
-                    mono
-                ).astype(np.int16)
-
-            with system_lock:
-
-                system_buffer.extend(mono.tolist())
-
-                while len(system_buffer) >= CHUNK_FRAMES:
-
-                    chunk = np.array(
-                        system_buffer[:CHUNK_FRAMES],
-                        dtype=np.int16
-                    )
-
-                    del system_buffer[:CHUNK_FRAMES]
-
-                    audio_queue.put(chunk)
-
-        except Exception as e:
-
-            if recording:
-                print("SYSTEM AUDIO ERROR:", str(e))
-
-            break
+    def close(self):
+        try:
+            self._stream.stop_stream()
+            self._stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._pa.terminate()
+        except Exception:  # noqa: BLE001
+            pass
 
 
-def get_audio_chunk():
+class AudioCapture:
+    def __init__(self, use_mic=True, use_system=True, queue_size=100):
+        self.use_mic = use_mic
+        self.use_system = use_system
+        self.audio_queue = queue.Queue(maxsize=queue_size)
+        self._sources = []
+        self._thread = None
+        self._stop_event = threading.Event()
 
-    try:
-        return audio_queue.get(timeout=0.5)
+    def start(self):
+        """Open the sources and start mixing. Returns a list of warning strings."""
+        warnings = []
+        self._stop_event.clear()
+        self._sources = []
+        if self.use_mic:
+            try:
+                self._sources.append(_MicSource())
+            except Exception as exc:  # noqa: BLE001
+                warnings.append("Microphone unavailable: %s" % exc)
+        if self.use_system:
+            try:
+                self._sources.append(_LoopbackSource())
+            except Exception as exc:  # noqa: BLE001
+                warnings.append("System audio unavailable: %s" % exc)
+        if not self._sources:
+            raise RuntimeError("No audio source could be opened. " + " ".join(warnings))
+        self._thread = threading.Thread(target=self._mix_loop, daemon=True, name="AudioMixer")
+        self._thread.start()
+        return warnings
 
-    except queue.Empty:
-        return None
+    def _mix_loop(self):
+        next_tick = time.monotonic()
+        while not self._stop_event.is_set():
+            mixed = np.zeros(TARGET_BLOCK, dtype=np.float32)
+            for src in self._sources:
+                block = src.pop()
+                if block is not None:
+                    mixed += block
+            np.clip(mixed, -1.0, 1.0, out=mixed)
+            put_drop_oldest(self.audio_queue, mixed)
+            next_tick += BLOCK_SECONDS
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tick = time.monotonic()  # we fell behind; do not try to catch up
 
-
-def stop_recording():
-
-    global recording_stream
-    global system_stream, system_audio
-    global recording
-
-    if recording_stream is None:
-        return None
-
-    recording = False
-
-    recording_stream.stop()
-    recording_stream.close()
-
-    recording_stream = None
-
-    if system_stream is not None:
-
-        system_stream.stop_stream()
-        system_stream.close()
-
-        system_stream = None
-
-    if system_audio is not None:
-
-        system_audio.terminate()
-        system_audio = None
-
-    with audio_lock:
-
-        if audio_data:
-
-            complete_audio = np.concatenate(
-                audio_data
-            )
-
-            wav.write(
-                "recording.wav",
-                SAMPLE_RATE,
-                complete_audio
-            )
-
-    audio_queue.put("STOP")
-
-    print("Microphone and system audio recording stopped!")
-
-    return "recording.wav"
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+        for src in self._sources:
+            src.close()
+        self._sources = []
+        # empty the queue so the next recording starts clean
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
